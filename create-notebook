@@ -1,0 +1,79 @@
+#!/bin/bash
+
+export AWS_DEFAULT_OUTPUT=json
+
+ACCOUNT=$(aws sts get-caller-identity | jq -r .Account)
+REGION=$(aws configure get region)
+
+# Assume role and bucket already exists
+ROLE=$(aws iam list-roles | jq -r '.Roles | .[] | .Arn' | grep service-role | grep SageMaker)
+NOTEBOOK_NAME=rps
+BUCKET="ac3-sumerian-rps-sagemaker"
+
+aws sagemaker create-notebook-instance \
+  --notebook-instance-name ${NOTEBOOK_NAME} \
+  --instance-type ml.p2.xlarge \
+  --role-arn "${ROLE}" \
+  | jq .
+
+echo -n Waiting for notebook to start
+while [ $(aws sagemaker describe-notebook-instance --notebook-instance-name ${NOTEBOOK_NAME} | jq -r .NotebookInstanceStatus) != "InService" ]; do
+  echo -n .
+  sleep 1
+done
+echo  Done
+
+
+URL=$(aws sagemaker create-presigned-notebook-instance-url \
+  --notebook-instance-name ${NOTEBOOK_NAME} \
+  | jq -r .AuthorizedUrl
+)
+BASEURL=${URL%%?authToken*}
+JAR=$(mktemp /tmp/cookie-jar.XXXXXX)
+DATA=$(mktemp /tmp/data.XXXXXX)
+
+
+CURL_ARGS="--silent --cookie $JAR --cookie-jar $JAR"
+
+# Log in
+curl ${CURL_ARGS} --location "${URL}" --silent > /dev/null
+
+echo 'Uploading...'
+echo '{"content": '"$(cat notebook.ipynb)"', "format": "json", "type": "notebook"}' >| $DATA
+curl ${CURL_ARGS} -X PUT "${BASEURL}/api/contents/notebook.ipynb" --data @$DATA > /dev/null
+
+echo "Visit ${BASEURL} and run the notebook then press enter"
+echo
+echo "Waiting..."
+read
+
+echo "Downloading..."
+# List contents
+curl ${CURL_ARGS} "${BASEURL}/api/contents" | jq .
+curl ${CURL_ARGS} "${BASEURL}/api/contents/notebook.ipynb" | jq -r .content >| notebook-new.ipynb
+jupyter nbconvert --to html notebook-new.ipynb  --output notebook.html
+
+
+## Convert the model to something useable
+curl ${CURL_ARGS} "${BASEURL}/api/contents/rps-keras-final.hdf5" | jq -r .content | base64 -d >| rps-keras-final.hdf5
+tensorflowjs_converter --input_format keras model/keras/rps-keras-final.hdf5 public/tsmodel
+
+echo "Done".
+
+echo "Nuking everything..."
+rm ${JAR} ${DATA}
+
+aws sagemaker stop-notebook-instance \
+  --notebook-instance-name ${NOTEBOOK_NAME} \
+  | jq .
+
+echo -n Waiting for notebook to stop
+while [ $(aws sagemaker describe-notebook-instance --notebook-instance-name ${NOTEBOOK_NAME} | jq -r .NotebookInstanceStatus) != "Stopped" ]; do
+  echo -n .
+  sleep 1
+done
+echo  Done
+
+aws sagemaker delete-notebook-instance \
+  --notebook-instance-name ${NOTEBOOK_NAME} \
+  | jq .
